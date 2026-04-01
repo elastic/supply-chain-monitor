@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+.ruff_cache/
+.mypy_cache/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs
+logs/
+
+# Runtime state
+last_serial.yaml
+
+# Secrets / config
+etc/slack.json
+
+# Downloaded package artifacts
+analysis/*/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store

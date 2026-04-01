@@ -1,0 +1,21 @@
+Supply Chain Monitor
+Copyright 2026 Elastic N.V.
+
+This product includes software developed at Elastic
+(https://www.elastic.co/).
+
+---
+
+This project uses data from the following third-party sources:
+
+- hugovk/top-pypi-packages (MIT License)
+  https://github.com/hugovk/top-pypi-packages
+
+- npm download-counts / nice-registry
+  https://github.com/nice-registry/download-counts
+
+- PyPI XML-RPC and JSON APIs
+  https://warehouse.pypa.io/
+
+- npm registry and CouchDB replication API
+  https://replicate.npmjs.com / https://registry.npmjs.org
