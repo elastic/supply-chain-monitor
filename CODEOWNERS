@@ -1,5 +1,2 @@
 # Default reviewers for pull requests (see GitHub code owners docs).
-# Replace the placeholder below with real GitHub users or a team handle, e.g.:
-# * @elastic/my-team
-#
-# * @elastic/supply-chain-monitor-maintainers
+* @elastic/trade-admins

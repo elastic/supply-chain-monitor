@@ -1,3 +1,6 @@
+# Copyright 2026 Elastic N.V.
+# Licensed under the MIT License. See LICENSE file in the project root for details.
+
 """
 Compare two versions of a pip package without installing them.
 

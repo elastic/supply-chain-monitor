@@ -1,3 +1,6 @@
+# Copyright 2026 Elastic N.V.
+# Licensed under the MIT License. See LICENSE file in the project root for details.
+
 """
 Monitor top PyPI packages for new releases using changelog_since_serial.
 
