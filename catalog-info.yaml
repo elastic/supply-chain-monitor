@@ -26,7 +26,7 @@ spec:
       provider_settings:
         build_pull_request_forks: true
       teams:
-        trade-admins:
+        protections-leads:
           access_level: MANAGE_BUILD_AND_READ
         everyone:
           access_level: READ_ONLY
