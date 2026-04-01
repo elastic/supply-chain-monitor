@@ -11,46 +11,45 @@ Both ecosystems are monitored by default. Use `--no-pypi` or `--no-npm` to disab
 Each ecosystem runs its own polling thread but shares the analysis and alerting pipeline.
 
 ```
-         ┌─── PyPI ──────────────────────┐   ┌─── npm ────────────────────────┐
-         │                               │   │                                │
-         │  changelog_since_serial()     │   │  CouchDB _changes feed        │
-         │         │                     │   │         │                      │
-         │         ▼                     │   │         ▼                      │
-         │   ┌───────────┐  filter       │   │   ┌───────────┐  filter       │
-         │   │ All PyPI   │──────────┐   │   │   │ All npm    │──────────┐   │
-         │   │ events     │          │   │   │   │ changes    │          │   │
-         │   └───────────┘          ▼   │   │   └───────────┘          ▼   │
-         │         hugovk ──► Watchlist   │   │   download-counts ► Watchlist │
-         │                       │       │   │                       │       │
-         │              "new release"    │   │        new versions since      │
-         │               events only     │   │          last poll epoch       │
-         └───────────┬───────────────────┘   └───────────┬───────────────────┘
-                     │                                   │
-                     ▼                                   ▼
-              ┌───────────────────┐               ┌───────────────────┐
-              │ Download old + new │               │ Download old + new │
-              │ (sdist + wheel)    │               │ (tarball)          │
-              └─────────┬─────────┘               └─────────┬─────────┘
-                        │                                   │
-                        └──────────────┬────────────────────┘
-                                       ▼
-                                ┌──────────────┐
-                                │ Unified diff  │
-                                │ report (.md)  │
-                                └──────┬───────┘
-                                       ▼
-                                ┌──────────────┐
-                                │ Cursor Agent  │  ◄── LLM analysis
-                                │ CLI (ask mode)│      (read-only)
-                                └──────┬───────┘
-                                       │
-                                  verdict?
-                                       │
-                              malicious │
-                                       ▼
-                                ┌──────────────┐
-                                │ Slack alert   │
-                                └──────────────┘
+         ┌─── PyPI ──────────────────────┐   ┌─── npm ───────────────────────┐
+         │                               │   │                               │
+         │ changelog_since_serial()      │   │ CouchDB _changes feed         │
+         │       │                       │   │       │                       │
+         │       ▼                       │   │       ▼                       │
+         │  ┌────────────┐               │   │  ┌────────────┐               │
+         │  │ All PyPI   │─┐             │   │  │ All npm    │─┐             │
+         │  │ events     │ │             │   │  │ changes    │ │             │
+         │  └────────────┘ ▼             │   │  └────────────┘ ▼             │
+         │ hugovk ──► Watchlist          │   │ download-counts ─► Watchlist  │
+         │       │                       │   │       │                       │
+         │ "new release" events only     │   │ new versions since last epoch │
+         └───────────────┬───────────────┘   └───────────────┬───────────────┘
+                         │                                   │
+                         ▼                                   ▼
+               ┌───────────────────┐               ┌───────────────────┐
+               │ Download old + new│               │ Download old + new│
+               │ (sdist + wheel)   │               │ (tarball)         │
+               └───────────────────┘               └───────────────────┘
+                         │                                   │
+                         └─────────────────┬─────────────────┘
+                                           ▼
+                                   ┌───────────────┐
+                                   │ Unified diff  │
+                                   │ report (.md)  │
+                                   └───────┬───────┘
+                                           ▼
+                                   ┌───────────────┐  ◄── LLM analysis
+                                   │ Cursor Agent  │      (read-only)
+                                   │ CLI (ask mode)│
+                                   └───────┬───────┘
+                                           │
+                                       verdict?
+                                           │
+                                 malicious │
+                                           ▼
+                                   ┌───────────────┐
+                                   │ Slack alert   │
+                                   └───────────────┘
 ```
 
 ### Detection Targets
@@ -198,7 +197,7 @@ python package_diff.py --local old.tar.gz new.tar.gz -n mypackage
 Downloads are done directly via registry APIs (PyPI JSON API / npm registry), not pip or npm. This means:
 - **No pip/npm dependency** for downloads
 - **Platform-agnostic** — can download and diff Linux-only packages from Windows
-- PyPI: prefers sdist (source), falls back to any wheel
+- PyPI: prefers wheel (pure-Python when available), falls back to sdist
 - npm: downloads tarballs directly from the registry
 
 ### analyze_diff.py — LLM Verdict
