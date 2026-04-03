@@ -77,7 +77,13 @@ def _find_agent() -> str:
     )
 
 
-def run_cursor_agent(diff_file: Path, model: str = "composer-2-fast") -> str:
+def run_cursor_agent(
+    diff_file: Path, model: str = "composer-2-fast",
+) -> tuple[str, str]:
+    """Run Cursor Agent CLI on a diff file.
+
+    Returns (stdout, stderr) from the agent process.
+    """
     agent_bin = _find_agent()
     workspace = diff_file.parent.resolve()
 
@@ -112,9 +118,9 @@ def run_cursor_agent(diff_file: Path, model: str = "composer-2-fast") -> str:
 
     if result.returncode != 0:
         log.error("Cursor agent exited %d: %s", result.returncode, result.stderr)
-        return ""
+        return "", result.stderr or ""
 
-    return result.stdout or ""
+    return result.stdout or "", result.stderr or ""
 
 
 def parse_verdict(output: str) -> tuple[str, str]:
@@ -140,7 +146,7 @@ def main():
 
     print(f"[*] Analyzing {args.diff_file.name} with Cursor Agent...", file=sys.stderr)
 
-    raw_output = run_cursor_agent(args.diff_file, model=args.model)
+    raw_output, _stderr = run_cursor_agent(args.diff_file, model=args.model)
     verdict, analysis = parse_verdict(raw_output)
 
     if args.json_output:

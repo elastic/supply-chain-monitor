@@ -20,6 +20,7 @@ logs/
 
 # Runtime state
 last_serial.yaml
+extensions_cache/
 
 # Secrets / config
 etc/slack.json
