@@ -56,7 +56,8 @@ from pathlib import Path
 
 import yaml
 
-from analyze_diff import parse_verdict, run_cursor_agent
+from analyze_diff import CHROME_INSTRUCTIONS_TEMPLATE, parse_verdict, run_cursor_agent
+from chrome_analysis import generate_chrome_report
 from chrome_diff import check_extension_version, download_crx, extract_crx
 from package_diff import (
     collect_files,
@@ -273,6 +274,7 @@ def analyze_report(
     new_version: str,
     *,
     model: str | None = None,
+    ecosystem: str = "pypi",
 ) -> tuple[str, str]:
     """Write report to a temp workspace, run Cursor Agent, return (verdict, analysis)."""
     effective_model = model or "composer-2-fast"
@@ -285,8 +287,11 @@ def analyze_report(
     if log.isEnabledFor(logging.VERBOSE):  # type: ignore[attr-defined]
         log.log(logging.VERBOSE, "Diff report for %s %s:\n%s", package, new_version, report[:5000])  # type: ignore[attr-defined]
 
+    chrome_template = CHROME_INSTRUCTIONS_TEMPLATE if ecosystem == "chrome" else None
     try:
-        raw_output, stderr = run_cursor_agent(diff_file, model=effective_model)
+        raw_output, stderr = run_cursor_agent(
+            diff_file, model=effective_model, instructions_template=chrome_template,
+        )
         verdict, analysis = parse_verdict(raw_output)
 
         if log.isEnabledFor(logging.VERBOSE):  # type: ignore[attr-defined]
@@ -981,10 +986,10 @@ def process_extension_update(
         files_old = collect_files(old_root)
         files_new = collect_files(new_root)
 
-        report = generate_report(name, old_version, new_version, files_old, files_new)
+        report = generate_chrome_report(name, old_version, new_version, files_old, files_new)
 
         log.info("[chrome] Analyzing diff for %s...", name)
-        verdict, analysis = analyze_report(report, name, new_version, model=model)
+        verdict, analysis = analyze_report(report, name, new_version, model=model, ecosystem="chrome")
         log.info("[chrome] Verdict for %s %s: %s", name, new_version, verdict.upper())
 
         if verdict == "malicious":
