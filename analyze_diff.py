@@ -7,6 +7,13 @@ Analyze a package diff report for supply chain compromise using Cursor Agent CLI
 Takes a diff markdown file (output of package_diff.py) and returns a verdict
 of "malicious" or "benign" with supporting analysis.
 
+Provides two instruction templates:
+- ``INSTRUCTIONS_TEMPLATE`` — generic supply-chain analysis for PyPI/npm.
+- ``CHROME_INSTRUCTIONS_TEMPLATE`` — Chrome-extension-specific analysis with
+  known attack patterns (Cyberhaven, TamperedChef, CSP stripping, credential
+  harvesting) and guidance for interpreting the pre-analysis summary produced
+  by ``chrome_analysis.py``.
+
 Usage:
     python analyze_diff.py <diff_file>
     python analyze_diff.py telnyx_diff.md

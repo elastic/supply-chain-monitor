@@ -11,6 +11,14 @@ for signs of compromise, and alerts Slack if anything malicious is found.
 Chrome extension monitoring uses a YAML watchlist file (chrome_extensions.yaml)
 that maps extension IDs to their last known versions. Extensions are cached
 locally so that old versions are available for diffing when updates arrive.
+Use --chrome-top to auto-populate the watchlist with the most popular
+extensions from the Chrome Web Store, and --chrome-extensions-init to seed
+the cache (also resolves real extension names from manifest.json).
+
+Chrome extension diffs include a pre-analysis summary with permission change
+detection, renamed-file matching, and suspicious-pattern scanning (see
+chrome_analysis.py) so that the LLM receives pre-digested signals and token
+usage stays low.
 
 All ecosystems are monitored by default when their configuration exists.
 Use --no-pypi, --no-npm, or --no-chrome-extensions to disable individual ones.
@@ -33,6 +41,7 @@ Usage:
     python monitor.py --npm-top 5000               # npm: watch top 5000 only
     python monitor.py --npm-seq 42817000           # npm: start from specific sequence
 
+    python monitor.py --chrome-top 500             # populate watchlist with top 500 extensions
     python monitor.py --chrome-extensions-init     # seed the extension cache (one-time)
     python monitor.py --chrome-extensions-file f.yaml  # custom watchlist path
     python monitor.py --chrome-extensions-cache /tmp/c # custom cache directory
@@ -43,6 +52,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import shutil
 import tempfile
 import threading
@@ -58,7 +68,7 @@ import yaml
 
 from analyze_diff import CHROME_INSTRUCTIONS_TEMPLATE, parse_verdict, run_cursor_agent
 from chrome_analysis import generate_chrome_report
-from chrome_diff import check_extension_version, download_crx, extract_crx
+from chrome_diff import check_extension_version, download_crx, extract_crx, fetch_top_extensions
 from package_diff import (
     collect_files,
     download_npm_package,
@@ -1165,6 +1175,94 @@ def chrome_run_once(
         time.sleep(0.5)
 
 
+def _resolve_extension_name(cache_dir: Path, ext_id: str, version: str) -> str | None:
+    """Read the display name from a cached extension's manifest.json.
+
+    Handles ``__MSG_*__`` i18n placeholders by looking up the default locale
+    messages file.  Returns None if the name cannot be determined.
+    """
+    ext_root = cache_dir / ext_id / version
+    manifest_path = ext_root / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8", errors="replace"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    name = manifest.get("name", "")
+    if not name:
+        return None
+
+    # Resolve __MSG_key__ i18n placeholders
+    msg_match = re.match(r"^__MSG_(\w+)__$", name)
+    if msg_match:
+        msg_key = msg_match.group(1).lower()
+        locale = manifest.get("default_locale", "en")
+        msgs_path = ext_root / "_locales" / locale / "messages.json"
+        if not msgs_path.exists():
+            # Try 'en' as fallback
+            msgs_path = ext_root / "_locales" / "en" / "messages.json"
+        if msgs_path.exists():
+            try:
+                msgs = json.loads(msgs_path.read_text(encoding="utf-8", errors="replace"))
+                # Message keys are case-insensitive
+                for key, val in msgs.items():
+                    if key.lower() == msg_key:
+                        resolved = val.get("message", "")
+                        if resolved:
+                            return resolved
+            except (json.JSONDecodeError, OSError):
+                pass
+        return None
+
+    return name
+
+
+def _update_extension_name(path: Path, ext_id: str, new_name: str) -> None:
+    """Update the name of a single extension in the watchlist file."""
+    extensions = load_extensions_watchlist(path)
+    for entry in extensions:
+        if entry["id"] == ext_id:
+            entry["name"] = new_name
+            break
+    save_extensions_watchlist(path, extensions)
+
+
+def chrome_populate_top(extensions_file: Path, count: int) -> None:
+    """Fetch top *count* extensions from the Chrome Web Store and add to watchlist.
+
+    Extensions already in the watchlist are kept as-is (not duplicated).
+    New entries are added with version="" so ``--chrome-extensions-init`` will
+    cache them and populate their real names from manifest.json.
+    """
+    top = fetch_top_extensions(count)
+    if not top:
+        log.error("[chrome-top] No extensions returned from Chrome Web Store")
+        return
+
+    # Load existing watchlist (or start fresh)
+    if extensions_file.exists():
+        existing = load_extensions_watchlist(extensions_file)
+    else:
+        existing = []
+
+    existing_ids = {e["id"] for e in existing}
+    added = 0
+    for ext in top:
+        if ext["id"] not in existing_ids:
+            existing.append({"id": ext["id"], "name": ext["name"], "version": ""})
+            existing_ids.add(ext["id"])
+            added += 1
+
+    save_extensions_watchlist(extensions_file, existing)
+    log.info(
+        "[chrome-top] Done. Added %d new extensions (%d already existed). "
+        "Total watchlist: %d. Run --chrome-extensions-init to cache them.",
+        added, len(top) - added, len(existing),
+    )
+
+
 def chrome_init(extensions_file: Path, cache_dir: Path) -> None:
     """Download and cache current versions of all watched extensions (one-time setup)."""
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1207,6 +1305,14 @@ def chrome_init(extensions_file: Path, cache_dir: Path) -> None:
             else:
                 failed_extensions.append((ext_id, name, "download/extraction failed"))
                 failed += 1
+
+        # Resolve the real extension name from manifest.json if the current
+        # name is just the ID or a URL-slug placeholder.
+        if name == ext_id or name == ext_id[:32]:
+            resolved = _resolve_extension_name(cache_dir, ext_id, latest_version)
+            if resolved and resolved != name:
+                log.info("[chrome-init] %d/%d Resolved name: %s -> %s", i, len(extensions), ext_id[:16], resolved)
+                _update_extension_name(extensions_file, ext_id, resolved)
 
         time.sleep(0.5)
 
@@ -1253,6 +1359,8 @@ def main():
                               help="Path to extensions watchlist YAML (default: chrome_extensions.yaml)")
     chrome_group.add_argument("--chrome-extensions-cache", type=Path, default=None, metavar="DIR",
                               help="Cache directory for extension versions (default: extensions_cache/)")
+    chrome_group.add_argument("--chrome-top", type=int, default=None, metavar="N",
+                              help="Populate watchlist with top N popular extensions from Chrome Web Store, then exit")
 
     args = parser.parse_args()
 
@@ -1266,6 +1374,11 @@ def main():
 
     extensions_file = args.chrome_extensions_file or EXTENSIONS_FILE_DEFAULT
     cache_dir = args.chrome_extensions_cache or EXTENSIONS_CACHE_DIR
+
+    if args.chrome_top:
+        chrome_populate_top(extensions_file, args.chrome_top)
+        return
+
     enable_chrome = not args.no_chrome_extensions and extensions_file.exists()
 
     if args.chrome_extensions_init:
