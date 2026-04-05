@@ -38,7 +38,7 @@ import xmlrpc.client
 from datetime import datetime, timezone
 from pathlib import Path
 
-from analyze_diff import parse_verdict, run_cursor_agent
+from analyze_diff import parse_verdict, run_claude_code, run_cursor_agent
 from package_diff import (
     collect_files,
     download_npm_package,
@@ -247,15 +247,19 @@ def analyze_report(
     new_version: str,
     *,
     model: str | None = None,
+    backend: str = "cursor",
 ) -> tuple[str, str]:
-    """Write report to a temp workspace, run Cursor Agent, return (verdict, analysis)."""
+    """Write report to a temp workspace, run AI analysis, return (verdict, analysis)."""
     safe_name = package.replace("/", "_").replace("@", "")
     workspace = Path(tempfile.mkdtemp(prefix=f"scm_analyze_{safe_name}_"))
     diff_file = workspace / f"{safe_name}_diff.md"
     diff_file.write_text(report, encoding="utf-8")
-    log.info("Diff written to %s", diff_file)
+    log.info("Diff written to %s (backend: %s)", diff_file, backend)
     try:
-        raw_output = run_cursor_agent(diff_file, model=model or "composer-2-fast")
+        if backend == "claude":
+            raw_output = run_claude_code(diff_file, model=model or "claude-sonnet-4-6")
+        else:
+            raw_output = run_cursor_agent(diff_file, model=model or "composer-2-fast")
         verdict, analysis = parse_verdict(raw_output)
     except Exception:
         log.error("Analysis failed for %s %s:\n%s", package, new_version, traceback.format_exc())
@@ -516,6 +520,7 @@ def process_npm_release(
     slack: bool = False,
     *,
     model: str | None = None,
+    backend: str = "cursor",
 ) -> str:
     """Full pipeline for one npm release: diff -> analyze -> alert. Returns verdict."""
     log.info("[npm] Processing %s %s (rank #%s)...", package, new_version, f"{rank:,}")
@@ -532,7 +537,7 @@ def process_npm_release(
 
     try:
         log.info("[npm] Analyzing diff for %s...", package)
-        verdict, analysis = analyze_report(report, package, new_version, model=model)
+        verdict, analysis = analyze_report(report, package, new_version, model=model, backend=backend)
         log.info("[npm] Verdict for %s %s: %s", package, new_version, verdict.upper())
 
         if verdict == "malicious":
@@ -574,6 +579,7 @@ def process_release(
     slack: bool = False,
     *,
     model: str | None = None,
+    backend: str = "cursor",
 ) -> str:
     """Full pipeline for one release: diff -> analyze -> alert. Returns verdict."""
     log.info("[pypi] Processing %s %s (rank #%s)...", package, new_version, f"{rank:,}")
@@ -590,7 +596,7 @@ def process_release(
 
     try:
         log.info("[pypi] Analyzing diff for %s...", package)
-        verdict, analysis = analyze_report(report, package, new_version, model=model)
+        verdict, analysis = analyze_report(report, package, new_version, model=model, backend=backend)
         log.info("[pypi] Verdict for %s %s: %s", package, new_version, verdict.upper())
 
         if verdict == "malicious":
@@ -610,6 +616,7 @@ def poll_loop(
     initial_serial: int | None = None,
     state_path: Path | None = None,
     model: str | None = None,
+    backend: str = "cursor",
 ):
     state_path = state_path or LAST_SERIAL_PATH
     client = xmlrpc.client.ServerProxy(PYPI_XMLRPC)
@@ -663,7 +670,7 @@ def poll_loop(
             for package, version, ts in releases:
                 rank = watchlist.get(package.lower(), 0)
                 verdict = process_release(
-                    package, version, rank, slack=slack, model=model,
+                    package, version, rank, slack=slack, model=model, backend=backend,
                 )
                 stats["checked"] += 1
                 stats[verdict] = stats.get(verdict, 0) + 1
@@ -684,6 +691,7 @@ def run_once(
     *,
     since_serial: int | None = None,
     model: str | None = None,
+    backend: str = "cursor",
 ):
     client = xmlrpc.client.ServerProxy(PYPI_XMLRPC)
     current_serial = client.changelog_last_serial()
@@ -708,7 +716,7 @@ def run_once(
 
     for package, version, ts in releases:
         rank = watchlist.get(package.lower(), 0)
-        process_release(package, version, rank, slack=slack, model=model)
+        process_release(package, version, rank, slack=slack, model=model, backend=backend)
 
 
 # ---------------------------------------------------------------------------
@@ -723,6 +731,7 @@ def npm_poll_loop(
     initial_seq: int | None = None,
     state_path: Path | None = None,
     model: str | None = None,
+    backend: str = "cursor",
 ):
     state_path = state_path or LAST_SERIAL_PATH
 
@@ -801,7 +810,7 @@ def npm_poll_loop(
             for pkg, version in releases:
                 rank = watchlist.get(pkg.lower(), 0)
                 verdict = process_npm_release(
-                    pkg, version, rank, slack=slack, model=model,
+                    pkg, version, rank, slack=slack, model=model, backend=backend,
                 )
                 stats["checked"] += 1
                 stats[verdict] = stats.get(verdict, 0) + 1
@@ -821,6 +830,7 @@ def npm_run_once(
     lookback_seconds: int = 600,
     *,
     model: str | None = None,
+    backend: str = "cursor",
 ):
     """One-shot: check for npm releases published in the last *lookback_seconds*."""
     cutoff_epoch = time.time() - lookback_seconds
@@ -858,7 +868,7 @@ def npm_run_once(
 
     for pkg, version in releases:
         rank = watchlist.get(pkg.lower(), 0)
-        process_npm_release(pkg, version, rank, slack=slack, model=model)
+        process_npm_release(pkg, version, rank, slack=slack, model=model, backend=backend)
 
 
 # ---------------------------------------------------------------------------
@@ -871,7 +881,8 @@ def main():
     parser.add_argument("--interval", type=int, default=300, help="Poll interval in seconds (default: 300)")
     parser.add_argument("--once", action="store_true", help="Single pass over recent events, then exit")
     parser.add_argument("--slack", action="store_true", help="Enable Slack alerts for malicious findings")
-    parser.add_argument("--model", help="Override model for Cursor Agent analysis")
+    parser.add_argument("--model", help="Override model for analysis (default depends on --backend)")
+    parser.add_argument("--backend", choices=["cursor", "claude"], default="cursor", help="AI backend for analysis (default: cursor)")
     parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging (includes agent raw output)")
 
     pypi_group = parser.add_argument_group("PyPI options")
@@ -905,11 +916,12 @@ def main():
                 slack=args.slack,
                 since_serial=args.serial,
                 model=args.model,
+                backend=args.backend,
             )
         if enable_npm:
             npm_top = args.npm_top or args.top
             npm_watchlist = load_npm_watchlist(npm_top)
-            npm_run_once(npm_watchlist, slack=args.slack, model=args.model)
+            npm_run_once(npm_watchlist, slack=args.slack, model=args.model, backend=args.backend)
     else:
         threads: list[threading.Thread] = []
 
@@ -922,6 +934,7 @@ def main():
                     "slack": args.slack,
                     "initial_serial": args.serial,
                     "model": args.model,
+                    "backend": args.backend,
                 },
                 daemon=True,
                 name="pypi-poll",
@@ -938,6 +951,7 @@ def main():
                     "slack": args.slack,
                     "initial_seq": args.npm_seq,
                     "model": args.model,
+                    "backend": args.backend,
                 },
                 daemon=True,
                 name="npm-poll",
