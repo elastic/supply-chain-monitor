@@ -1,0 +1,6 @@
+# Chrome extension watchlist — add extension IDs to monitor.
+# 'version' is updated automatically when a new version is processed.
+# Set version to "" for first-run (will cache current version without diffing).
+- id: ghbmnnjooekpmoecnnnilnnbdlolhkhi
+  name: Google Docs Offline
+  version: 1.102.1

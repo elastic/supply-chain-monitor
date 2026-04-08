@@ -2,24 +2,49 @@
 # Licensed under the MIT License. See LICENSE file in the project root for details.
 
 """
-Supply chain monitor for top PyPI and npm packages.
+Supply chain monitor for top PyPI and npm packages, and Chrome extensions.
 
 Polls PyPI and npm for new releases of the top N packages, diffs each new
 release against its previous version, analyzes the diff with Cursor Agent
 for signs of compromise, and alerts Slack if anything malicious is found.
 
-Both ecosystems are monitored by default. Use --no-pypi or --no-npm to
-disable one.
+Chrome extension monitoring uses a YAML watchlist file (chrome_extensions.yaml)
+that maps extension IDs to their last known versions. Extensions are cached
+locally so that old versions are available for diffing when updates arrive.
+Use --chrome-top to auto-populate the watchlist with the most popular
+extensions from the Chrome Web Store, and --chrome-extensions-init to seed
+the cache (also resolves real extension names from manifest.json).
+
+Chrome extension diffs include a pre-analysis summary with permission change
+detection, renamed-file matching, and suspicious-pattern scanning (see
+chrome_analysis.py) so that the LLM receives pre-digested signals and token
+usage stays low.
+
+All ecosystems are monitored by default when their configuration exists.
+Use --no-pypi, --no-npm, or --no-chrome-extensions to disable individual ones.
+Chrome extension monitoring is enabled automatically when chrome_extensions.yaml exists.
 
 Usage:
-    python monitor.py                          # monitor both PyPI and npm
-    python monitor.py --top 15000              # top 15000 for each ecosystem
-    python monitor.py --interval 120           # poll every 2 min
-    python monitor.py --once                    # one-shot scan (no Slack by default)
-    python monitor.py --slack                    # continuous, with Slack alerts
-    python monitor.py --no-npm                 # PyPI only
-    python monitor.py --no-pypi               # npm only
-    python monitor.py --no-pypi --npm-top 5000 # npm only, top 5000
+    python monitor.py                              # monitor all available ecosystems
+    python monitor.py --top 15000                  # top 15000 packages for PyPI/npm
+    python monitor.py --interval 120               # poll every 2 min
+    python monitor.py --once                       # one-shot scan, then exit
+    python monitor.py --slack                      # enable Slack alerts
+    python monitor.py --model claude-4-opus        # override LLM model
+    python monitor.py -v                           # verbose: show diffs + agent info
+    python monitor.py --debug                      # full debug logging
+
+    python monitor.py --no-pypi                    # npm + Chrome extensions only
+    python monitor.py --no-npm                     # PyPI + Chrome extensions only
+    python monitor.py --no-chrome-extensions        # PyPI + npm only
+    python monitor.py --serial 35542000            # PyPI: start from specific serial
+    python monitor.py --npm-top 5000               # npm: watch top 5000 only
+    python monitor.py --npm-seq 42817000           # npm: start from specific sequence
+
+    python monitor.py --chrome-top 500             # populate watchlist with top 500 extensions
+    python monitor.py --chrome-extensions-init     # seed the extension cache (one-time)
+    python monitor.py --chrome-extensions-file f.yaml  # custom watchlist path
+    python monitor.py --chrome-extensions-cache /tmp/c # custom cache directory
 """
 
 from __future__ import annotations
@@ -27,6 +52,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import shutil
 import tempfile
 import threading
@@ -38,7 +64,11 @@ import xmlrpc.client
 from datetime import datetime, timezone
 from pathlib import Path
 
-from analyze_diff import parse_verdict, run_cursor_agent
+import yaml
+
+from analyze_diff import CHROME_INSTRUCTIONS_TEMPLATE, parse_verdict, run_cursor_agent
+from chrome_analysis import generate_chrome_report
+from chrome_diff import check_extension_version, download_crx, extract_crx, fetch_top_extensions
 from package_diff import (
     collect_files,
     download_npm_package,
@@ -52,6 +82,10 @@ from slack import Slack
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / f"monitor_{datetime.now().strftime('%Y%m%d')}.log"
+
+# Custom VERBOSE level between DEBUG(10) and INFO(20)
+logging.VERBOSE = 15  # type: ignore[attr-defined]
+logging.addLevelName(logging.VERBOSE, "VERBOSE")  # type: ignore[attr-defined]
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -75,6 +109,9 @@ NPM_REPLICATE = "https://replicate.npmjs.com"
 NPM_REGISTRY = "https://registry.npmjs.org"
 NPM_SEARCH = "https://registry.npmjs.org/-/v1/search"
 NPM_MAX_CHANGES_PER_CYCLE = 10000
+
+EXTENSIONS_FILE_DEFAULT = Path(__file__).resolve().parent / "chrome_extensions.yaml"
+EXTENSIONS_CACHE_DIR = Path(__file__).resolve().parent / "extensions_cache"
 
 _state_lock = threading.Lock()
 
@@ -247,16 +284,32 @@ def analyze_report(
     new_version: str,
     *,
     model: str | None = None,
+    ecosystem: str = "pypi",
 ) -> tuple[str, str]:
     """Write report to a temp workspace, run Cursor Agent, return (verdict, analysis)."""
+    effective_model = model or "composer-2-fast"
     safe_name = package.replace("/", "_").replace("@", "")
     workspace = Path(tempfile.mkdtemp(prefix=f"scm_analyze_{safe_name}_"))
     diff_file = workspace / f"{safe_name}_diff.md"
     diff_file.write_text(report, encoding="utf-8")
-    log.info("Diff written to %s", diff_file)
+    log.info("Diff written to %s (%d bytes)", diff_file, len(report))
+
+    if log.isEnabledFor(logging.VERBOSE):  # type: ignore[attr-defined]
+        log.log(logging.VERBOSE, "Diff report for %s %s:\n%s", package, new_version, report[:5000])  # type: ignore[attr-defined]
+
+    chrome_template = CHROME_INSTRUCTIONS_TEMPLATE if ecosystem == "chrome" else None
     try:
-        raw_output = run_cursor_agent(diff_file, model=model or "composer-2-fast")
+        raw_output, stderr = run_cursor_agent(
+            diff_file, model=effective_model, instructions_template=chrome_template,
+        )
         verdict, analysis = parse_verdict(raw_output)
+
+        if log.isEnabledFor(logging.VERBOSE):  # type: ignore[attr-defined]
+            log.log(logging.VERBOSE, "Agent model: %s", effective_model)  # type: ignore[attr-defined]
+            if stderr:
+                log.log(logging.VERBOSE, "Agent stderr:\n%s", stderr.strip())  # type: ignore[attr-defined]
+            log.log(logging.VERBOSE, "Agent output for %s %s:\n%s", package, new_version, analysis[:5000])  # type: ignore[attr-defined]
+
     except Exception:
         log.error("Analysis failed for %s %s:\n%s", package, new_version, traceback.format_exc())
         log.error("Diff preserved at %s", diff_file)
@@ -279,6 +332,9 @@ def send_slack_alert(
     if ecosystem == "npm":
         eco_label = "npm"
         pkg_url = f"https://www.npmjs.com/package/{package}/v/{version}"
+    elif ecosystem == "chrome":
+        eco_label = "Chrome Extension"
+        pkg_url = f"https://chromewebstore.google.com/detail/{package}"
     else:
         eco_label = "PyPI"
         pkg_url = f"https://pypi.org/project/{package}/{version}/"
@@ -862,17 +918,425 @@ def npm_run_once(
 
 
 # ---------------------------------------------------------------------------
+# Chrome extension helpers
+# ---------------------------------------------------------------------------
+
+def load_extensions_watchlist(path: Path) -> list[dict]:
+    """Load the Chrome extensions watchlist from a YAML file.
+
+    Each entry must have at least an 'id' key.  'version' and 'name' are
+    optional (version defaults to "" which triggers a first-run cache).
+    """
+    text = path.read_text(encoding="utf-8")
+    data = yaml.safe_load(text)
+    if data is None:
+        return []
+    if not isinstance(data, list):
+        raise ValueError(f"extensions watchlist must be a YAML list, got {type(data).__name__}")
+    for entry in data:
+        if "id" not in entry:
+            raise ValueError(f"Extension entry missing 'id': {entry}")
+        entry.setdefault("version", "")
+        entry.setdefault("name", entry["id"])
+    return data
+
+
+def save_extensions_watchlist(path: Path, extensions: list[dict]) -> None:
+    """Write the extensions watchlist back to YAML, preserving the header comment."""
+    # Preserve leading comment lines from the original file
+    header_lines: list[str] = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("#"):
+                header_lines.append(line)
+            else:
+                break
+
+    with _state_lock:
+        body = yaml.dump(extensions, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        content = "\n".join(header_lines) + "\n" + body if header_lines else body
+        path.write_text(content, encoding="utf-8")
+
+
+def update_extension_version(path: Path, ext_id: str, new_version: str) -> None:
+    """Update the version of a single extension in the watchlist file."""
+    extensions = load_extensions_watchlist(path)
+    for entry in extensions:
+        if entry["id"] == ext_id:
+            entry["version"] = new_version
+            break
+    save_extensions_watchlist(path, extensions)
+
+
+def process_extension_update(
+    ext_id: str,
+    name: str,
+    old_version: str,
+    new_version: str,
+    codebase_url: str,
+    cache_dir: Path,
+    slack: bool = False,
+    *,
+    model: str | None = None,
+) -> str:
+    """Full pipeline for one extension update: download -> diff -> analyze -> alert."""
+    log.info("[chrome] Processing %s (%s) %s -> %s...", name, ext_id, old_version, new_version)
+
+    old_root = cache_dir / ext_id / old_version
+    if not old_root.exists() or not any(old_root.iterdir()):
+        log.warning("[chrome] Cached version %s not found for %s, treating as first run", old_version, name)
+        return "skipped"
+
+    safe_name = ext_id[:16]
+    tmp = Path(tempfile.mkdtemp(prefix=f"scm_chrome_{safe_name}_"))
+    try:
+        crx_path = download_crx(codebase_url, tmp / "dl")
+        new_root = extract_crx(crx_path, tmp / "ext_new")
+
+        files_old = collect_files(old_root)
+        files_new = collect_files(new_root)
+
+        report = generate_chrome_report(name, old_version, new_version, files_old, files_new)
+
+        log.info("[chrome] Analyzing diff for %s...", name)
+        verdict, analysis = analyze_report(report, name, new_version, model=model, ecosystem="chrome")
+        log.info("[chrome] Verdict for %s %s: %s", name, new_version, verdict.upper())
+
+        if verdict == "malicious":
+            send_slack_alert(
+                name, new_version, 0, verdict, analysis,
+                slack=slack, ecosystem="chrome",
+            )
+
+        # Update cache: store new version, remove old
+        new_cache = cache_dir / ext_id / new_version
+        if new_cache.exists():
+            shutil.rmtree(new_cache)
+        shutil.copytree(new_root, new_cache)
+        shutil.rmtree(old_root, ignore_errors=True)
+
+        return verdict
+    except Exception:
+        log.error(
+            "[chrome] Failed to process %s %s->%s:\n%s",
+            name, old_version, new_version, traceback.format_exc(),
+        )
+        return "error"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _cache_extension(
+    ext_id: str, name: str, version: str, codebase_url: str, cache_dir: Path,
+) -> bool:
+    """Download and cache an extension version for future diffing. Returns True on success."""
+    log.info("[chrome] First run for %s — caching version %s (no diff)", name, version)
+    tmp = Path(tempfile.mkdtemp(prefix=f"scm_chrome_cache_{ext_id[:16]}_"))
+    try:
+        crx_path = download_crx(codebase_url, tmp / "dl")
+        extracted = extract_crx(crx_path, tmp / "ext")
+        dest = cache_dir / ext_id / version
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(extracted, dest)
+        return True
+    except Exception:
+        log.error("[chrome] Failed to cache %s %s:\n%s", name, version, traceback.format_exc())
+        return False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def chrome_poll_loop(
+    extensions_file: Path,
+    cache_dir: Path,
+    interval: int,
+    slack: bool = False,
+    *,
+    model: str | None = None,
+):
+    """Continuously poll Chrome Web Store for extension updates."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    log.info("[chrome] Starting Chrome extension monitor — polling every %ss", interval)
+
+    stats = {"checked": 0, "benign": 0, "malicious": 0, "error": 0, "skipped": 0, "first_run": 0}
+
+    try:
+        while True:
+            try:
+                extensions = load_extensions_watchlist(extensions_file)
+            except Exception:
+                log.error("[chrome] Failed to load watchlist:\n%s", traceback.format_exc())
+                time.sleep(interval)
+                continue
+
+            if not extensions:
+                log.debug("[chrome] Watchlist is empty, sleeping")
+                time.sleep(interval)
+                continue
+
+            for ext in extensions:
+                ext_id = ext["id"]
+                name = ext.get("name", ext_id)
+                stored_version = ext.get("version", "")
+
+                try:
+                    latest_version, codebase_url = check_extension_version(ext_id)
+                except Exception:
+                    log.error("[chrome] Failed to check %s:\n%s", name, traceback.format_exc())
+                    stats["error"] += 1
+                    time.sleep(0.5)
+                    continue
+
+                if stored_version == latest_version:
+                    log.debug("[chrome] %s is up to date (%s)", name, latest_version)
+                    time.sleep(0.5)
+                    continue
+
+                stats["checked"] += 1
+                cached_old = cache_dir / ext_id / stored_version
+
+                if not stored_version or not cached_old.exists():
+                    # First run or missing cache — cache inline but suggest --chrome-extensions-init
+                    log.warning(
+                        "[chrome] %s not cached — caching now (use --chrome-extensions-init for bulk setup)",
+                        name,
+                    )
+                    if _cache_extension(ext_id, name, latest_version, codebase_url, cache_dir):
+                        update_extension_version(extensions_file, ext_id, latest_version)
+                        stats["first_run"] += 1
+                    else:
+                        stats["error"] += 1
+                else:
+                    verdict = process_extension_update(
+                        ext_id, name, stored_version, latest_version,
+                        codebase_url, cache_dir, slack=slack, model=model,
+                    )
+                    stats[verdict] = stats.get(verdict, 0) + 1
+                    update_extension_version(extensions_file, ext_id, latest_version)
+
+                log.info("[chrome] Stats: %s", stats)
+                time.sleep(0.5)
+
+            time.sleep(interval)
+
+    except KeyboardInterrupt:
+        log.info("[chrome] Stopped. Stats: %s", stats)
+
+
+def chrome_run_once(
+    extensions_file: Path,
+    cache_dir: Path,
+    slack: bool = False,
+    *,
+    model: str | None = None,
+):
+    """One-shot: check all watched extensions for updates."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    extensions = load_extensions_watchlist(extensions_file)
+
+    if not extensions:
+        log.info("[chrome] Watchlist is empty, nothing to check")
+        return
+
+    log.info("[chrome] One-shot: checking %d extensions", len(extensions))
+
+    for ext in extensions:
+        ext_id = ext["id"]
+        name = ext.get("name", ext_id)
+        stored_version = ext.get("version", "")
+
+        try:
+            latest_version, codebase_url = check_extension_version(ext_id)
+        except Exception:
+            log.error("[chrome] Failed to check %s:\n%s", name, traceback.format_exc())
+            continue
+
+        if stored_version == latest_version:
+            log.info("[chrome] %s is up to date (%s)", name, latest_version)
+            continue
+
+        cached_old = cache_dir / ext_id / stored_version
+
+        if not stored_version or not cached_old.exists():
+            log.warning(
+                "[chrome] %s not cached — caching now (use --chrome-extensions-init for bulk setup)",
+                name,
+            )
+            if _cache_extension(ext_id, name, latest_version, codebase_url, cache_dir):
+                update_extension_version(extensions_file, ext_id, latest_version)
+        else:
+            process_extension_update(
+                ext_id, name, stored_version, latest_version,
+                codebase_url, cache_dir, slack=slack, model=model,
+            )
+            update_extension_version(extensions_file, ext_id, latest_version)
+
+        time.sleep(0.5)
+
+
+def _resolve_extension_name(cache_dir: Path, ext_id: str, version: str) -> str | None:
+    """Read the display name from a cached extension's manifest.json.
+
+    Handles ``__MSG_*__`` i18n placeholders by looking up the default locale
+    messages file.  Returns None if the name cannot be determined.
+    """
+    ext_root = cache_dir / ext_id / version
+    manifest_path = ext_root / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8", errors="replace"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    name = manifest.get("name", "")
+    if not name:
+        return None
+
+    # Resolve __MSG_key__ i18n placeholders
+    msg_match = re.match(r"^__MSG_(\w+)__$", name)
+    if msg_match:
+        msg_key = msg_match.group(1).lower()
+        locale = manifest.get("default_locale", "en")
+        msgs_path = ext_root / "_locales" / locale / "messages.json"
+        if not msgs_path.exists():
+            # Try 'en' as fallback
+            msgs_path = ext_root / "_locales" / "en" / "messages.json"
+        if msgs_path.exists():
+            try:
+                msgs = json.loads(msgs_path.read_text(encoding="utf-8", errors="replace"))
+                # Message keys are case-insensitive
+                for key, val in msgs.items():
+                    if key.lower() == msg_key:
+                        resolved = val.get("message", "")
+                        if resolved:
+                            return resolved
+            except (json.JSONDecodeError, OSError):
+                pass
+        return None
+
+    return name
+
+
+def _update_extension_name(path: Path, ext_id: str, new_name: str) -> None:
+    """Update the name of a single extension in the watchlist file."""
+    extensions = load_extensions_watchlist(path)
+    for entry in extensions:
+        if entry["id"] == ext_id:
+            entry["name"] = new_name
+            break
+    save_extensions_watchlist(path, extensions)
+
+
+def chrome_populate_top(extensions_file: Path, count: int) -> None:
+    """Fetch top *count* extensions from the Chrome Web Store and add to watchlist.
+
+    Extensions already in the watchlist are kept as-is (not duplicated).
+    New entries are added with version="" so ``--chrome-extensions-init`` will
+    cache them and populate their real names from manifest.json.
+    """
+    top = fetch_top_extensions(count)
+    if not top:
+        log.error("[chrome-top] No extensions returned from Chrome Web Store")
+        return
+
+    # Load existing watchlist (or start fresh)
+    if extensions_file.exists():
+        existing = load_extensions_watchlist(extensions_file)
+    else:
+        existing = []
+
+    existing_ids = {e["id"] for e in existing}
+    added = 0
+    for ext in top:
+        if ext["id"] not in existing_ids:
+            existing.append({"id": ext["id"], "name": ext["name"], "version": ""})
+            existing_ids.add(ext["id"])
+            added += 1
+
+    save_extensions_watchlist(extensions_file, existing)
+    log.info(
+        "[chrome-top] Done. Added %d new extensions (%d already existed). "
+        "Total watchlist: %d. Run --chrome-extensions-init to cache them.",
+        added, len(top) - added, len(existing),
+    )
+
+
+def chrome_init(extensions_file: Path, cache_dir: Path) -> None:
+    """Download and cache current versions of all watched extensions (one-time setup)."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    extensions = load_extensions_watchlist(extensions_file)
+
+    if not extensions:
+        log.info("[chrome-init] Watchlist is empty, nothing to cache")
+        return
+
+    log.info("[chrome-init] Seeding cache for %d extensions...", len(extensions))
+    cached, skipped, failed = 0, 0, 0
+    failed_extensions: list[tuple[str, str, str]] = []  # (id, name, reason)
+
+    for i, ext in enumerate(extensions, 1):
+        ext_id = ext["id"]
+        name = ext.get("name", ext_id)
+        stored_version = ext.get("version", "")
+
+        try:
+            latest_version, codebase_url = check_extension_version(ext_id)
+        except Exception as e:
+            reason = str(e).split("\n", 1)[0]
+            log.error("[chrome-init] %d/%d Failed to check %s (%s): %s", i, len(extensions), name, ext_id, reason)
+            failed_extensions.append((ext_id, name, reason))
+            failed += 1
+            time.sleep(0.5)
+            continue
+
+        existing_cache = cache_dir / ext_id / latest_version
+        if existing_cache.exists() and any(existing_cache.iterdir()):
+            log.debug("[chrome-init] %d/%d %s %s already cached", i, len(extensions), name, latest_version)
+            if stored_version != latest_version:
+                update_extension_version(extensions_file, ext_id, latest_version)
+            skipped += 1
+        else:
+            log.info("[chrome-init] %d/%d Caching %s %s...", i, len(extensions), name, latest_version)
+            if _cache_extension(ext_id, name, latest_version, codebase_url, cache_dir):
+                update_extension_version(extensions_file, ext_id, latest_version)
+                cached += 1
+            else:
+                failed_extensions.append((ext_id, name, "download/extraction failed"))
+                failed += 1
+
+        # Resolve the real extension name from manifest.json if the current
+        # name is just the ID or a URL-slug placeholder.
+        if name == ext_id or name == ext_id[:32]:
+            resolved = _resolve_extension_name(cache_dir, ext_id, latest_version)
+            if resolved and resolved != name:
+                log.info("[chrome-init] %d/%d Resolved name: %s -> %s", i, len(extensions), ext_id[:16], resolved)
+                _update_extension_name(extensions_file, ext_id, resolved)
+
+        time.sleep(0.5)
+
+    log.info("[chrome-init] Done. Cached: %d | Already cached: %d | Failed: %d", cached, skipped, failed)
+    if failed_extensions:
+        log.warning("[chrome-init] The following %d extensions failed (may not exist in the Web Store):", len(failed_extensions))
+        for ext_id, name, reason in failed_extensions:
+            log.warning("[chrome-init]   %s (%s): %s", name, ext_id, reason)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Supply chain monitor (PyPI + npm)")
+    parser = argparse.ArgumentParser(description="Supply chain monitor (PyPI + npm + Chrome extensions)")
     parser.add_argument("--top", type=int, default=15000, help="Top N packages to watch per ecosystem (default: 15000)")
     parser.add_argument("--interval", type=int, default=300, help="Poll interval in seconds (default: 300)")
     parser.add_argument("--once", action="store_true", help="Single pass over recent events, then exit")
     parser.add_argument("--slack", action="store_true", help="Enable Slack alerts for malicious findings")
     parser.add_argument("--model", help="Override model for Cursor Agent analysis")
-    parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging (includes agent raw output)")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Verbose output: show diff reports, agent model, and agent stderr (token usage)")
+    parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging (includes full agent raw output)")
 
     pypi_group = parser.add_argument_group("PyPI options")
     pypi_group.add_argument("--no-pypi", action="store_true", help="Disable PyPI monitoring")
@@ -886,16 +1350,46 @@ def main():
     npm_group.add_argument("--npm-seq", type=int, default=None, metavar="N",
                            help="npm replication sequence to start from")
 
+    chrome_group = parser.add_argument_group("Chrome extension options")
+    chrome_group.add_argument("--no-chrome-extensions", action="store_true",
+                              help="Disable Chrome extension monitoring")
+    chrome_group.add_argument("--chrome-extensions-init", action="store_true",
+                              help="Download and cache current versions of all watched extensions, then exit")
+    chrome_group.add_argument("--chrome-extensions-file", type=Path, default=None, metavar="PATH",
+                              help="Path to extensions watchlist YAML (default: chrome_extensions.yaml)")
+    chrome_group.add_argument("--chrome-extensions-cache", type=Path, default=None, metavar="DIR",
+                              help="Cache directory for extension versions (default: extensions_cache/)")
+    chrome_group.add_argument("--chrome-top", type=int, default=None, metavar="N",
+                              help="Populate watchlist with top N popular extensions from Chrome Web Store, then exit")
+
     args = parser.parse_args()
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
+    elif args.verbose:
+        logging.getLogger().setLevel(logging.VERBOSE)  # type: ignore[attr-defined]
 
     enable_pypi = not args.no_pypi
     enable_npm = not args.no_npm
 
-    if not enable_pypi and not enable_npm:
-        parser.error("Cannot disable both --no-pypi and --no-npm")
+    extensions_file = args.chrome_extensions_file or EXTENSIONS_FILE_DEFAULT
+    cache_dir = args.chrome_extensions_cache or EXTENSIONS_CACHE_DIR
+
+    if args.chrome_top:
+        chrome_populate_top(extensions_file, args.chrome_top)
+        return
+
+    enable_chrome = not args.no_chrome_extensions and extensions_file.exists()
+
+    if args.chrome_extensions_init:
+        if not extensions_file.exists():
+            parser.error(f"Chrome extension watchlist not found: {extensions_file}")
+        chrome_init(extensions_file, cache_dir)
+        if not enable_chrome and not enable_pypi and not enable_npm:
+            return
+
+    if not enable_pypi and not enable_npm and not enable_chrome:
+        parser.error("All ecosystems disabled (check --no-pypi/--no-npm/--no-chrome-extensions, or that chrome_extensions.yaml exists)")
 
     if args.once:
         if enable_pypi:
@@ -910,6 +1404,8 @@ def main():
             npm_top = args.npm_top or args.top
             npm_watchlist = load_npm_watchlist(npm_top)
             npm_run_once(npm_watchlist, slack=args.slack, model=args.model)
+        if enable_chrome:
+            chrome_run_once(extensions_file, cache_dir, slack=args.slack, model=args.model)
     else:
         threads: list[threading.Thread] = []
 
@@ -941,6 +1437,19 @@ def main():
                 },
                 daemon=True,
                 name="npm-poll",
+            )
+            threads.append(t)
+
+        if enable_chrome:
+            t = threading.Thread(
+                target=chrome_poll_loop,
+                args=(extensions_file, cache_dir, args.interval),
+                kwargs={
+                    "slack": args.slack,
+                    "model": args.model,
+                },
+                daemon=True,
+                name="chrome-poll",
             )
             threads.append(t)
 
